@@ -27,6 +27,18 @@
 //! So: rate *and* burst, per key. Set `burst: 1` to get strict spacing where that is genuinely what the
 //! server wants.
 //!
+//! # Per-kind, or connection-wide?
+//!
+//! Worth settling before choosing a control, because the two look identical from a single-kind probe and
+//! call for opposite designs. Push **two different** request kinds at once, each at a rate that is clean
+//! on its own. Both still clean ⇒ the budget is per kind, and one shared bucket would be actively wrong:
+//! it makes one kind's traffic delay another that has spent nothing, and taxes every request for a
+//! ceiling it is nowhere near. Something trips ⇒ the budget really is connection-wide, and belongs in a
+//! single bucket outside this type.
+//!
+//! Where the budget is per kind but applies to *every* kind, [`Pacer::with_default`] is the shape: list
+//! the kinds you have measured, and let the rest mint their own bucket at a default rate.
+//!
 //! # Where to put the wait
 //!
 //! In the **caller's** task, before the request is built or enqueued, and inside the caller's own deadline —
@@ -117,32 +129,92 @@ impl Bucket {
     }
 }
 
-/// Per-key token buckets, resolved once at construction.
+/// Per-key token buckets, resolved at construction — plus, optionally, a **default** rate that gives
+/// every other key a bucket of its own.
 ///
-/// A key absent from the map is **unlimited**, which is the common case — pace only what the server
-/// actually throttles.
+/// With [`new`](Self::new), a key absent from the map is unlimited: pace only what the server actually
+/// throttles. With [`with_default`](Self::with_default), an absent key instead gets its own bucket at
+/// the default rate, created on first use.
+///
+/// The distinction matters more than it looks, and it is the difference between two limits that are
+/// easy to confuse:
+///
+/// - A **connection-wide** budget is one bucket shared by every kind of request. Model it outside this
+///   type — one rate, one queue — because that is what it is.
+/// - A **per-kind** budget that happens to apply to *every* kind is N independent buckets. That is
+///   [`with_default`](Self::with_default), and modelling it as one shared bucket is strictly wrong: it
+///   makes traffic on one kind delay an unrelated kind that has spent nothing, and it charges every
+///   request for a ceiling it is nowhere near.
+///
+/// Measuring which one you have takes two *different* request kinds sent at once, each at a rate that
+/// is clean alone. If both stay clean, the budget is per kind.
 #[derive(Debug, Default)]
 pub struct Pacer {
     buckets: HashMap<u32, Arc<Mutex<Bucket>>>,
+    /// Applied to any key not in `buckets`. `None` leaves unlisted keys unpaced.
+    default_rate: Option<Rate>,
+    /// Buckets minted on demand for keys covered by `default_rate`. A plain `std::sync::Mutex`: it is
+    /// held only across a map lookup and never across an await.
+    ///
+    /// Unbounded in principle. In practice the key space is a protocol's set of message types — small,
+    /// closed, and known at compile time — so this settles at a fixed size. Do not hand it keys drawn
+    /// from user input.
+    minted: std::sync::Mutex<HashMap<u32, Arc<Mutex<Bucket>>>>,
 }
 
 impl Pacer {
-    /// Build from a `key -> rate` map. A non-positive rate is treated as unlimited rather than as a
-    /// deadlock: it is what a caller reaches for to mean "no limit".
+    /// Build from a `key -> rate` map. Keys not in the map are **unlimited**. A non-positive rate is
+    /// treated as unlimited rather than as a deadlock: it is what a caller reaches for to mean "no
+    /// limit".
     pub fn new(rates: &HashMap<u32, Rate>) -> Self {
-        let now = Instant::now();
         Self {
-            buckets: rates
-                .iter()
-                .filter(|(_, r)| r.per_second.is_finite() && r.per_second > 0.0)
-                .map(|(&k, &r)| (k, Arc::new(Mutex::new(Bucket::new(r, now)))))
-                .collect(),
+            buckets: Self::explicit(rates),
+            default_rate: None,
+            minted: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
+    /// As [`new`](Self::new), but every key *not* in the map gets its **own** bucket at `default`.
+    ///
+    /// For the common shape where a server budgets each request kind separately: a handful of kinds are
+    /// measured and listed, and the rest share a rate but not a queue.
+    pub fn with_default(rates: &HashMap<u32, Rate>, default: Rate) -> Self {
+        Self {
+            buckets: Self::explicit(rates),
+            default_rate: Some(default).filter(|r| r.per_second.is_finite() && r.per_second > 0.0),
+            minted: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn explicit(rates: &HashMap<u32, Rate>) -> HashMap<u32, Arc<Mutex<Bucket>>> {
+        let now = Instant::now();
+        rates
+            .iter()
+            .filter(|(_, r)| r.per_second.is_finite() && r.per_second > 0.0)
+            .map(|(&k, &r)| (k, Arc::new(Mutex::new(Bucket::new(r, now)))))
+            .collect()
+    }
+
+    /// This key's bucket: the explicit one, else a minted default, else `None` when unpaced.
+    fn bucket(&self, key: u32) -> Option<Arc<Mutex<Bucket>>> {
+        if let Some(b) = self.buckets.get(&key) {
+            return Some(b.clone());
+        }
+        let rate = self.default_rate?;
+        let mut minted = self.minted.lock().unwrap_or_else(|e| e.into_inner());
+        Some(
+            minted
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(Bucket::new(rate, Instant::now()))))
+                .clone(),
+        )
+    }
+
     /// Whether `key` is paced at all — for callers that want to skip the await entirely.
+    ///
+    /// Always true under [`with_default`](Self::with_default), since every key is then paced.
     pub fn is_limited(&self, key: u32) -> bool {
-        self.buckets.contains_key(&key)
+        self.buckets.contains_key(&key) || self.default_rate.is_some()
     }
 
     /// Wait until `key` may send, then consume one token. Returns immediately when `key` is unpaced.
@@ -150,7 +222,7 @@ impl Pacer {
     /// Call this in the caller's task, *before* building or enqueueing the request, and inside whatever
     /// deadline the caller asked for — see the module docs.
     pub async fn acquire(&self, key: u32) {
-        let Some(bucket) = self.buckets.get(&key).cloned() else {
+        let Some(bucket) = self.bucket(key) else {
             return;
         };
         // FIFO: waiters queue on the mutex in arrival order, and each holds it only until its own token is
@@ -170,7 +242,7 @@ impl Pacer {
     /// For a driver that must gate its own loop rather than await: arm a `sleep_until` on this and keep the
     /// command arms disabled until it fires.
     pub async fn ready_at(&self, key: u32) -> Option<Instant> {
-        let bucket = self.buckets.get(&key)?;
+        let bucket = self.bucket(key)?;
         let b = bucket.lock().await;
         let now = Instant::now();
         let wait = b.wait_for_one(now);
@@ -179,10 +251,107 @@ impl Pacer {
 
     /// Tokens currently available for `key`, or `None` if unpaced. Test/diagnostic use.
     pub async fn available(&self, key: u32) -> Option<f64> {
-        let bucket = self.buckets.get(&key)?;
+        let bucket = self.bucket(key)?;
         let mut b = bucket.lock().await;
         b.refill(Instant::now());
         Some(b.tokens)
+    }
+}
+
+#[cfg(test)]
+mod default_rate_tests {
+    use super::*;
+
+    fn rates(pairs: &[(u32, Rate)]) -> HashMap<u32, Rate> {
+        pairs.iter().copied().collect()
+    }
+
+    /// A default gives an unlisted key its **own** bucket, not a share of someone else's.
+    ///
+    /// This is the whole point of the feature and the thing a "one global bucket" implementation gets
+    /// wrong: spending key A's budget must leave key B untouched, because the server budgets them
+    /// separately. Modelled as one shared bucket, a busy A would delay a B that has spent nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_default_gives_each_unlisted_key_its_own_budget() {
+        let pacer = Pacer::with_default(&rates(&[]), Rate::new(10.0, 2));
+        // Drain key 1's burst entirely.
+        pacer.acquire(1).await;
+        pacer.acquire(1).await;
+        assert!(
+            pacer.available(1).await.unwrap() < 1.0,
+            "key 1's burst is spent"
+        );
+        // Key 2 has spent nothing and must be untouched.
+        assert_eq!(
+            pacer.available(2).await,
+            Some(2.0),
+            "an unrelated key shared key 1's bucket"
+        );
+
+        let start = Instant::now();
+        pacer.acquire(2).await;
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "key 2 waited on key 1's spending"
+        );
+    }
+
+    /// An explicit entry still wins over the default — that is what makes the default a *floor* for
+    /// the kinds nobody measured, rather than an override of the ones somebody did.
+    #[tokio::test(start_paused = true)]
+    async fn an_explicit_rate_beats_the_default() {
+        let pacer = Pacer::with_default(&rates(&[(7, Rate::new(1.0, 1))]), Rate::new(100.0, 100));
+        assert_eq!(
+            pacer.available(7).await,
+            Some(1.0),
+            "key 7 keeps its measured burst of 1"
+        );
+        assert_eq!(
+            pacer.available(8).await,
+            Some(100.0),
+            "key 8 takes the default"
+        );
+
+        pacer.acquire(7).await;
+        let start = Instant::now();
+        pacer.acquire(7).await; // 1/s, burst spent => must wait ~1s
+        assert!(
+            start.elapsed() >= Duration::from_millis(900),
+            "the explicit rate was not applied"
+        );
+    }
+
+    /// `new` must stay exactly as it was: no default, unlisted keys unpaced.
+    #[tokio::test(start_paused = true)]
+    async fn without_a_default_an_unlisted_key_is_still_unpaced() {
+        let pacer = Pacer::new(&rates(&[(7, Rate::new(1.0, 1))]));
+        assert!(!pacer.is_limited(8));
+        assert_eq!(pacer.available(8).await, None);
+        let start = Instant::now();
+        for _ in 0..1_000 {
+            pacer.acquire(8).await;
+        }
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "an unlisted key was paced without a default"
+        );
+    }
+
+    /// A minted bucket is minted **once**: the second caller must see the first one's spending, or the
+    /// default would be no limit at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_minted_bucket_is_reused_not_recreated() {
+        let pacer = Pacer::with_default(&rates(&[]), Rate::new(1.0, 2));
+        pacer.acquire(42).await;
+        pacer.acquire(42).await;
+        let start = Instant::now();
+        pacer.acquire(42).await; // burst spent; a fresh bucket would let this through instantly
+        assert!(
+            start.elapsed() >= Duration::from_millis(900),
+            "the bucket was re-minted, not reused"
+        );
     }
 }
 

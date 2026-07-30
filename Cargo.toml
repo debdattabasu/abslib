@@ -1,6 +1,6 @@
 [package]
 name = "abslib"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Reusable async networking primitives for single-task protocol drivers: egress backpressure, per-kind concurrency ceilings and rate pacing, and a shared refresh/single-flight registry"
 license = "MIT OR Apache-2.0"
