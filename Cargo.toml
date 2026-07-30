@@ -7,6 +7,9 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/debdattabasu/abslib"
 keywords = ["tokio", "backpressure", "networking", "async"]
 categories = ["asynchronous", "network-programming"]
+readme = "README.md"
+# Repo-maintenance files, not useful to a consumer of the crate.
+exclude = ["CLAUDE.md", ".gitignore"]
 
 [dependencies]
 # `sync` for the semaphore behind `limits`, `time` for the egress stall clock.
