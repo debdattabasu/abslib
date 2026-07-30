@@ -1,0 +1,20 @@
+[package]
+name = "abslib"
+version = "0.1.0"
+edition = "2021"
+description = "Reusable async networking primitives for single-task protocol drivers: egress backpressure, per-command concurrency ceilings, and a shared refresh/single-flight registry"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/debdattabasu/abslib"
+keywords = ["tokio", "backpressure", "networking", "async"]
+categories = ["asynchronous", "network-programming"]
+
+[dependencies]
+# `sync` for the semaphore behind `limits`, `time` for the egress stall clock.
+tokio = { version = "1", default-features = false, features = ["sync", "time"] }
+# Lock-free read path for `registry` — slots are read on every inbound frame.
+arc-swap = "1"
+
+[dev-dependencies]
+# `test-util` = `start_paused` / `time::advance`, so the clocks are tested against a virtual clock
+# instead of real sleeps. Tests only; nothing in `src/` calls `pause()`.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "test-util"] }
