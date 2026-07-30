@@ -155,9 +155,117 @@ impl RequestLimits {
         gate.acquire_owned().await.ok()
     }
 
+    /// Cap several kinds against **one shared** ceiling, for a server that budgets a *class* of
+    /// request rather than each kind separately.
+    ///
+    /// Builder-style so it composes with [`new`](Self::new): per-kind ceilings first, then any groups.
+    /// A key given here replaces whatever per-kind gate it had.
+    ///
+    /// ```
+    /// # use abslib::RequestLimits;
+    /// # use std::collections::HashMap;
+    /// # #[tokio::main(flavor = "current_thread")] async fn main() {
+    /// // Three kinds of bulk read that the server will only answer one at a time.
+    /// let limits = RequestLimits::new(&HashMap::new()).with_group(&[10, 11, 12], 1);
+    /// let held = limits.acquire(10).await.expect("a slot");
+    /// // ...and a DIFFERENT kind in the same group now waits, which is the whole point.
+    /// assert_eq!(limits.available(11), Some(0));
+    /// drop(held);
+    /// assert_eq!(limits.available(11), Some(1));
+    /// # }
+    /// ```
+    ///
+    /// **Reach for this only when a measurement says the kinds interact**, and be careful about which
+    /// measurement: a shared *concurrency* ceiling looks exactly like a per-kind *rate* budget from
+    /// the outside, because `rate ≈ concurrency ÷ latency`. A ceiling of 1 against a 250 ms server
+    /// presents as a clean "4/s per kind" right up until two kinds are run at once. The discriminator
+    /// is to issue the kinds **strictly serially with no delay at all**: that is the fastest a ceiling
+    /// of 1 permits, so a real rate budget trips on it and a concurrency ceiling does not.
+    pub fn with_group(mut self, keys: &[u32], max: usize) -> Self {
+        if max > 0 {
+            let gate = Arc::new(Semaphore::new(max));
+            for &k in keys {
+                self.gates.insert(k, gate.clone());
+            }
+        }
+        self
+    }
+
     /// Slots currently free for `code`, or `None` if uncapped. Test/diagnostic use.
     pub fn available(&self, code: u32) -> Option<usize> {
         self.gates.get(&code).map(|g| g.available_permits())
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A group is **one** ceiling shared by every kind in it, not one each.
+    ///
+    /// The distinction is the entire reason the method exists: a server that answers one bulk read at
+    /// a time does not care which bulk read it is, and per-kind gates that are each individually
+    /// correct still let two through together.
+    #[tokio::test]
+    async fn a_group_shares_one_ceiling_across_its_kinds() {
+        let limits = Arc::new(RequestLimits::new(&HashMap::new()).with_group(&[1, 2, 3], 1));
+        let held = limits.acquire(1).await.expect("slot");
+        assert_eq!(
+            limits.available(2),
+            Some(0),
+            "a sibling kind sees the slot as taken"
+        );
+        assert_eq!(limits.available(3), Some(0));
+
+        let l = limits.clone();
+        let other = tokio::spawn(async move { l.acquire(2).await.is_some() });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !other.is_finished(),
+            "a different kind in the group was admitted alongside"
+        );
+
+        drop(held);
+        assert!(tokio::time::timeout(Duration::from_secs(1), other)
+            .await
+            .expect("released")
+            .unwrap());
+    }
+
+    /// A group replaces the per-kind gate for its keys, and leaves every other key alone.
+    #[tokio::test]
+    async fn a_group_overrides_per_kind_gates_and_touches_nothing_else() {
+        let caps: HashMap<u32, usize> = [(1, 5), (9, 2)].into_iter().collect();
+        let limits = RequestLimits::new(&caps).with_group(&[1, 2], 1);
+        assert_eq!(
+            limits.available(1),
+            Some(1),
+            "key 1 took the group's ceiling, not its old 5"
+        );
+        assert_eq!(limits.available(2), Some(1));
+        assert_eq!(
+            limits.available(9),
+            Some(2),
+            "an ungrouped key keeps its own gate"
+        );
+        assert!(
+            !limits.is_limited(77),
+            "and an unlisted key is still unlimited"
+        );
+    }
+
+    /// `0` means unlimited here too, matching `new` rather than deadlocking the whole group.
+    #[tokio::test]
+    async fn a_group_ceiling_of_zero_is_unlimited() {
+        let limits = RequestLimits::new(&HashMap::new()).with_group(&[1, 2], 0);
+        assert!(!limits.is_limited(1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), limits.acquire(1))
+                .await
+                .expect("must not block")
+                .is_none()
+        );
     }
 }
 
