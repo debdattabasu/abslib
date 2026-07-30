@@ -92,7 +92,29 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Per-command in-flight ceilings, resolved into semaphores once at connect.
+/// Per-request-kind in-flight ceilings, resolved into semaphores once at connect.
+///
+/// ```
+/// # use abslib::limits::RequestLimits;
+/// # use std::collections::HashMap;
+/// # #[tokio::main(flavor = "current_thread")] async fn main() {
+/// // Kind 11 may have one request outstanding; everything else is unlimited.
+/// let limits = RequestLimits::new(&HashMap::from([(11, 1)]));
+///
+/// // Acquire BEFORE building or enqueueing the request, inside the caller's own deadline, so the
+/// // wait counts against the budget the caller asked for.
+/// let permit = limits.acquire(11).await;
+/// assert_eq!(limits.available(11), Some(0));
+///
+/// // An uncapped kind never waits and yields no permit, so the fast path costs one hash lookup.
+/// assert!(limits.acquire(22).await.is_none());
+///
+/// // The permit is owned: it returns on drop, however the request ends — reply, timeout, or a
+/// // caller that dropped its future. That last case is the one a hand-rolled counter gets wrong.
+/// drop(permit);
+/// assert_eq!(limits.available(11), Some(1));
+/// # }
+/// ```
 ///
 /// A kind that is absent is unlimited, which is the common case — cap only what the server caps.
 #[derive(Debug, Default)]

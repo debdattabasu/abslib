@@ -120,6 +120,35 @@ pub const DEFAULT_EGRESS_STALL_MS: u64 = 5_000;
 
 /// Cumulative byte accounting for one connection's egress buffer.
 ///
+/// ```
+/// # use abslib::egress::EgressMeter;
+/// # use std::time::Duration;
+/// # use tokio::time::Instant;
+/// # #[tokio::main(flavor = "current_thread")] async fn main() {
+/// let mut meter = EgressMeter::new(Duration::from_secs(5));
+/// let now = Instant::now();
+///
+/// // Two frames encoded into the buffer. `enqueue` returns the cumulative offset each one ENDS at —
+/// // keep it beside whatever correlation state the frame carries.
+/// let first = meter.enqueue(100, now);
+/// let second = meter.enqueue(50, now);
+/// assert_eq!((first, second), (100, 150));
+///
+/// // The kernel took 120 of the 150. `flushed` is DERIVED from what is still buffered, so it can
+/// // never drift from the buffer.
+/// let flushed = meter.observe(30, now);
+/// assert_eq!(flushed, 120);
+///
+/// // So frame 1 is on the wire and frame 2 is not — which is what makes at-most-once exact: on a
+/// // teardown, frame 2 was provably never seen and is cleanly re-sendable.
+/// assert!(first <= flushed && second > flushed);
+///
+/// // Nothing outstanding is never "stalled", however long it has been idle.
+/// meter.observe(0, now);
+/// assert!(!meter.stalled(0, now));
+/// # }
+/// ```
+///
 /// `enqueued` counts every byte handed to the buffer; `flushed` is recomputed from the buffer's current
 /// length, so the two can never disagree about what is outstanding. Frames are identified by the
 /// cumulative offset at which they *end* — [`enqueue`](Self::enqueue) returns it, and a frame has
