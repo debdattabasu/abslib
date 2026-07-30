@@ -94,6 +94,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Per-request-kind in-flight ceilings, resolved into semaphores once at connect.
 ///
+/// Keyed by `u32` so it fits both small command-byte protocols and protocols whose message type is a
+/// wider enum. A kind absent from the map is unlimited.
+///
 /// ```
 /// # use abslib::limits::RequestLimits;
 /// # use std::collections::HashMap;
@@ -119,13 +122,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// A kind that is absent is unlimited, which is the common case — cap only what the server caps.
 #[derive(Debug, Default)]
 pub struct RequestLimits {
-    gates: HashMap<u16, Arc<Semaphore>>,
+    gates: HashMap<u32, Arc<Semaphore>>,
 }
 
 impl RequestLimits {
     /// Build from a `code -> max concurrent` map. A limit of `0` is treated as unlimited rather than
     /// as a deadlock: it is what a caller reaches for to mean "no cap".
-    pub fn new(caps: &HashMap<u16, usize>) -> Self {
+    pub fn new(caps: &HashMap<u32, usize>) -> Self {
         Self {
             gates: caps
                 .iter()
@@ -136,7 +139,7 @@ impl RequestLimits {
     }
 
     /// Whether `code` is capped at all — for callers that want to skip the acquire entirely.
-    pub fn is_limited(&self, code: u16) -> bool {
+    pub fn is_limited(&self, code: u32) -> bool {
         self.gates.contains_key(&code)
     }
 
@@ -146,14 +149,14 @@ impl RequestLimits {
     /// The permit is **owned**, so it lives as long as the caller keeps it and is returned by `Drop` —
     /// including when the caller's future is dropped mid-request, which is the case a hand-rolled
     /// counter gets wrong.
-    pub async fn acquire(&self, code: u16) -> Option<OwnedSemaphorePermit> {
+    pub async fn acquire(&self, code: u32) -> Option<OwnedSemaphorePermit> {
         let gate = self.gates.get(&code)?.clone();
         // The semaphore is never closed, so this cannot fail.
         gate.acquire_owned().await.ok()
     }
 
     /// Slots currently free for `code`, or `None` if uncapped. Test/diagnostic use.
-    pub fn available(&self, code: u16) -> Option<usize> {
+    pub fn available(&self, code: u32) -> Option<usize> {
         self.gates.get(&code).map(|g| g.available_permits())
     }
 }
@@ -163,7 +166,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn caps(pairs: &[(u16, usize)]) -> HashMap<u16, usize> {
+    fn caps(pairs: &[(u32, usize)]) -> HashMap<u32, usize> {
         pairs.iter().copied().collect()
     }
 
