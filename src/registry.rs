@@ -151,6 +151,64 @@ impl<T> std::fmt::Debug for Slot<T> {
     }
 }
 
+/// Clears `fetching` however the fetch ends — **including when the caller's future is dropped**.
+///
+/// Without this, a cancelled fetch leaves the flag set forever and the slot is wedged for the whole
+/// process: `refresh_due` returns `false` (no refresh, ever) and every [`SlotHandle::merge`] /
+/// [`SlotHandle::update`] is pushed onto `deferred` instead of being applied — so updates stop
+/// landing *and* the buffer grows without bound. A registry is shared by construction, so one
+/// consumer's `tokio::time::timeout` around its first read would take the value down for every other
+/// consumer of that key.
+///
+/// It is reachable from ordinary code, which is what makes it worth an RAII type rather than a note:
+/// any caller that wraps a first read in a timeout, loses a `select!`, or is cancelled by a shutdown
+/// gets there.
+///
+/// Cancellation is treated exactly as a **failed** fetch: whatever was buffered replays onto the
+/// value that is still there, or is discarded when the slot is empty — the fetch that eventually
+/// succeeds reflects the source's state after those updates anyway.
+struct FetchGuard<'a, T> {
+    slot: &'a Slot<T>,
+    armed: bool,
+}
+
+impl<'a, T> FetchGuard<'a, T> {
+    /// Arm the guard **and** claim the slot, so the two can never be done separately.
+    fn claim(slot: &'a Slot<T>) -> Self {
+        slot.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fetching = true;
+        Self { slot, armed: true }
+    }
+
+    /// The fetch reached its own conclusion; the caller takes it from here.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<T> Drop for FetchGuard<'_, T> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut st = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.fetching = false;
+        let deferred = std::mem::take(&mut st.deferred);
+        let Some(cur) = self.slot.value.load_full() else {
+            return;
+        };
+        let mut next: Option<T> = None;
+        for m in deferred {
+            next = Some(m(next.as_ref().unwrap_or(&cur)));
+        }
+        if let Some(t) = next {
+            self.slot.value.store(Some(Arc::new(t)));
+        }
+    }
+}
+
 /// A lock-free view of one key's slot — **hold this for the life of a connection**.
 ///
 /// A native addition to the web mechanism, and the reason: live tick/book records resolve
@@ -360,6 +418,12 @@ impl<K, T> SlotHandle<K, T> {
     /// not yet due, returns `None` immediately rather than queueing. That is what keeps a fleet of N
     /// connections to one server to a single reconcile per interval — and what makes a caller-driven
     /// reload suppress the periodic one for its duration instead of colliding with it.
+    /// **The claim is not self-releasing, and this pair is the one place that is still true.** The
+    /// async fetchers hold a `FetchGuard`, so a dropped future releases `fetching` on the way out;
+    /// here the claim deliberately outlives the call, so nothing can tell a caller that is still
+    /// working from one that went away. A successful claim therefore *obliges* you to call
+    /// [`finish_refresh`](Self::finish_refresh) — including on the failure path, with `None` — or the
+    /// slot is wedged exactly as the guard exists to prevent.
     pub fn begin_refresh(&self, interval: Duration) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         let guard = self.slot.gate.clone().try_lock_owned().ok()?;
         let loaded = self.slot.value.load().is_some();
@@ -440,17 +504,19 @@ impl<K, T> SlotHandle<K, T> {
         };
         {
             let loaded = self.slot.value.load().is_some();
-            let mut st = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());
+            let st = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());
             if !st.refresh_due(loaded, interval, Instant::now()) {
                 return Ok(false); // the gate holder before us just did it
             }
-            // Buffering applies to a refresh exactly as to a first fetch: this snapshot is taken
-            // server-side at T, so a push at T+ε must be buffered or the snapshot reverts it.
-            st.fetching = true;
         }
+        // Buffering applies to a refresh exactly as to a first fetch: this snapshot is taken at T, so
+        // an update at T+ε must be buffered or the snapshot reverts it. The guard is what releases
+        // the claim if this future is dropped instead of completing.
+        let mut guard = FetchGuard::claim(&self.slot);
 
         let fetched = fetch().await;
 
+        guard.disarm();
         let mut st = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());
         st.fetching = false;
         let deferred = std::mem::take(&mut st.deferred);
@@ -511,11 +577,13 @@ impl<K, T> SlotHandle<K, T> {
     ///   caller in line fetches again; the gate serializes them, but a fleet cold-starting against a
     ///   failing source still costs one request per connection. Here a failure records
     ///   `next_attempt`, and callers arriving inside `retry_after` are answered without a request.
-    /// - **Cancellation safety.** Neither of the other two survives its future being dropped
-    ///   mid-fetch: `fetching` stays set, and the slot's refresh clock is then disabled forever. This
-    ///   caller runs inside the reconnect supervisor's `select!` and *is* dropped on `close()`. So
-    ///   this method never sets `fetching` — which costs nothing, because `fetching` exists only to
-    ///   buffer merges and a value with no push stream has none (§3.4).
+    /// - **No claim at all.** This method never sets `fetching`, which costs nothing because
+    ///   `fetching` exists only to buffer updates and a value with no push stream has none.
+    ///
+    ///   Until 0.2.1 that was also this method's *cancellation-safety* advantage, and the docs here
+    ///   recommended it on those grounds. That recommendation was wrong to make: the right fix was to
+    ///   close the hole rather than route around it, and the other two are now cancellation-safe by
+    ///   `FetchGuard` (`a_cancelled_fetch_does_not_wedge_the_slot`).
     ///
     /// Returns
     /// - `Ok(v)` — what the slot serves now: freshly fetched, freshly refreshed, or the previous
@@ -600,14 +668,11 @@ impl<K, T> SlotHandle<K, T> {
         if let Some(v) = self.load() {
             return Ok(v); // the caller that held the gate just filled it
         }
-        self.slot
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .fetching = true;
+        let mut guard = FetchGuard::claim(&self.slot);
 
         let fetched = fetch().await;
 
+        guard.disarm();
         let mut st = self.slot.state.lock().unwrap_or_else(|e| e.into_inner());
         st.fetching = false;
         let deferred = std::mem::take(&mut st.deferred);
@@ -1222,5 +1287,90 @@ mod tests {
         assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a(b"EURUSD:227:5"), fnv1a(b"EURUSD:227:5"));
         assert_ne!(fnv1a(b"EURUSD:227:5"), fnv1a(b"EURUSD:227:6"));
+    }
+
+    /// A caller that gives up mid-fetch must not leave the slot claimed.
+    ///
+    /// This is the worst failure the whole module has, because it is unbounded and silent: the
+    /// registry is process-wide, so `fetching` left set by a dropped future takes the slot down for
+    /// **every** consumer sharing it — nothing ever refreshes again, and every update is buffered
+    /// instead of applied. And it is trivially reachable: one caller wrapping its first read in a
+    /// `tokio::time::timeout` gets there.
+    #[tokio::test]
+    async fn a_cancelled_fetch_does_not_wedge_the_slot() {
+        let r = Arc::new(reg());
+        let started = Arc::new(tokio::sync::Notify::new());
+
+        {
+            let (r, notify) = (r.clone(), started.clone());
+            let task = tokio::spawn(async move {
+                r.handle(&key())
+                    .get_or_fetch::<_, _, ()>(|| async move {
+                        notify.notify_one();
+                        // Never completes: a fetch still in flight when the caller gives up.
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    })
+                    .await
+            });
+            started.notified().await;
+            task.abort();
+            let _ = task.await;
+        }
+
+        // An update arriving now must not be swallowed by a fetch that no longer exists...
+        assert!(
+            !r.handle(&key()).merge(1, |t: &Table| t.clone()),
+            "an empty slot has nothing to merge into"
+        );
+        // ...and the next caller must actually fetch.
+        let t = r
+            .handle(&key())
+            .get_or_fetch::<_, _, ()>(|| async { Ok(vec!["EURUSD".into()]) })
+            .await
+            .unwrap();
+        assert_eq!(t.len(), 1);
+        assert!(
+            r.handle(&key()).is_refresh_due(ZERO),
+            "and the refresh clock is running again"
+        );
+    }
+
+    /// The same hazard on the *refresh* path, where the old value is still in service — so the
+    /// symptom is different and worse to diagnose: reads keep working, and only the updates that
+    /// raced the abandoned refresh go missing.
+    #[tokio::test]
+    async fn a_cancelled_refresh_keeps_serving_and_replays_its_buffer() {
+        let r = Arc::new(reg());
+        r.handle(&key()).insert(Arc::new(vec!["EURUSD".into()]));
+        let started = Arc::new(tokio::sync::Notify::new());
+
+        let task = {
+            let (r, started) = (r.clone(), started.clone());
+            tokio::spawn(async move {
+                r.handle(&key())
+                    .refresh_if_due::<_, _, ()>(ZERO, NEVER, || async move {
+                        started.notify_one();
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    })
+                    .await
+            })
+        };
+        started.notified().await;
+        assert!(r.handle(&key()).merge(7, push("NEWSYM")));
+        task.abort();
+        let _ = task.await;
+
+        let value = r.get(&key()).expect("still serving");
+        assert!(value.contains(&"EURUSD".to_string()));
+        assert!(
+            value.contains(&"NEWSYM".to_string()),
+            "the buffered update landed on the surviving value"
+        );
+        assert!(
+            r.handle(&key()).is_refresh_due(ZERO),
+            "and another consumer may claim the refresh"
+        );
     }
 }
