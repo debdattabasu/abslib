@@ -63,7 +63,10 @@ pub struct Rate {
 impl Rate {
     /// `per_second` with a burst of `burst`, clamped to values a bucket can honour.
     pub fn new(per_second: f64, burst: u32) -> Self {
-        Self { per_second: per_second.max(f64::MIN_POSITIVE), burst: burst.max(1) }
+        Self {
+            per_second: per_second.max(f64::MIN_POSITIVE),
+            burst: burst.max(1),
+        }
     }
 
     /// Strict even spacing: no burst above the sustained rate.
@@ -82,20 +85,29 @@ struct Bucket {
 impl Bucket {
     fn new(rate: Rate, now: Instant) -> Self {
         // Start full: a connection that has just opened has not spent anything.
-        Self { tokens: rate.burst as f64, last: now, rate }
+        Self {
+            tokens: rate.burst as f64,
+            last: now,
+            rate,
+        }
     }
 
     fn refill(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
         if elapsed > 0.0 {
-            self.tokens = (self.tokens + elapsed * self.rate.per_second).min(self.rate.burst as f64);
+            self.tokens =
+                (self.tokens + elapsed * self.rate.per_second).min(self.rate.burst as f64);
             self.last = now;
         }
     }
 
     /// How long until one token is available. Zero when one is available now.
     fn wait_for_one(&self, now: Instant) -> Duration {
-        let mut probe = Bucket { tokens: self.tokens, last: self.last, rate: self.rate };
+        let mut probe = Bucket {
+            tokens: self.tokens,
+            last: self.last,
+            rate: self.rate,
+        };
         probe.refill(now);
         if probe.tokens >= 1.0 {
             Duration::ZERO
@@ -188,7 +200,11 @@ mod tests {
         assert!(!p.is_limited(22));
         let t0 = Instant::now();
         p.acquire(22).await;
-        assert_eq!(t0.elapsed(), Duration::ZERO, "an unpaced key must not sleep");
+        assert_eq!(
+            t0.elapsed(),
+            Duration::ZERO,
+            "an unpaced key must not sleep"
+        );
         assert_eq!(p.available(22).await, None);
     }
 
@@ -200,7 +216,11 @@ mod tests {
         for _ in 0..4 {
             p.acquire(11).await;
         }
-        assert_eq!(t0.elapsed(), Duration::ZERO, "the whole burst goes without waiting");
+        assert_eq!(
+            t0.elapsed(),
+            Duration::ZERO,
+            "the whole burst goes without waiting"
+        );
 
         // The bucket is now empty, so the fifth waits ~1/10 s for a token.
         p.acquire(11).await;
@@ -232,12 +252,19 @@ mod tests {
 
         // Idle for an hour: still capped at the burst, not an unbounded credit to spend at once.
         tokio::time::advance(Duration::from_secs(3600)).await;
-        assert_eq!(p.available(11).await, Some(3.0), "credit must not accumulate past the burst");
+        assert_eq!(
+            p.available(11).await,
+            Some(3.0),
+            "credit must not accumulate past the burst"
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn keys_are_paced_independently() {
-        let p = Pacer::new(&rates(&[(11, Rate::spaced(1.0)), (22, Rate::new(100.0, 10))]));
+        let p = Pacer::new(&rates(&[
+            (11, Rate::spaced(1.0)),
+            (22, Rate::new(100.0, 10)),
+        ]));
         p.acquire(11).await; // drains key 11's single token
         let t0 = Instant::now();
         p.acquire(22).await;
@@ -270,7 +297,11 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
-        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3, 4], "the pacer is not FIFO");
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![0, 1, 2, 3, 4],
+            "the pacer is not FIFO"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -285,7 +316,22 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_zero_or_negative_rate_means_unlimited_not_deadlock() {
-        let p = Pacer::new(&rates(&[(11, Rate { per_second: 0.0, burst: 1 }), (12, Rate { per_second: -5.0, burst: 1 })]));
+        let p = Pacer::new(&rates(&[
+            (
+                11,
+                Rate {
+                    per_second: 0.0,
+                    burst: 1,
+                },
+            ),
+            (
+                12,
+                Rate {
+                    per_second: -5.0,
+                    burst: 1,
+                },
+            ),
+        ]));
         assert!(!p.is_limited(11) && !p.is_limited(12));
         let t0 = Instant::now();
         p.acquire(11).await;

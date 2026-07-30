@@ -174,7 +174,10 @@ mod tests {
     async fn an_uncapped_command_never_waits_and_yields_no_permit() {
         let limits = RequestLimits::new(&caps(&[(11, 1)]));
         assert!(!limits.is_limited(3));
-        assert!(limits.acquire(3).await.is_none(), "an uncapped code hands out no permit");
+        assert!(
+            limits.acquire(3).await.is_none(),
+            "an uncapped code hands out no permit"
+        );
         assert_eq!(limits.available(3), None);
         // ...and taking the capped one does not affect it.
         let _held = limits.acquire(11).await.expect("capped");
@@ -191,10 +194,16 @@ mod tests {
         let l = limits.clone();
         let second = tokio::spawn(async move { l.acquire(11).await.is_some() });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!second.is_finished(), "the second caller was let through while the first held the slot");
+        assert!(
+            !second.is_finished(),
+            "the second caller was let through while the first held the slot"
+        );
 
         drop(first);
-        assert!(tokio::time::timeout(Duration::from_secs(1), second).await.expect("released").unwrap());
+        assert!(tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("released")
+            .unwrap());
     }
 
     #[tokio::test]
@@ -207,7 +216,11 @@ mod tests {
             assert_eq!(limits.available(5), Some(0));
             drop(held);
         }
-        assert_eq!(limits.available(5), Some(1), "the slot returned without anyone releasing it");
+        assert_eq!(
+            limits.available(5),
+            Some(1),
+            "the slot returned without anyone releasing it"
+        );
 
         // And a future abandoned while *waiting* must not leave the gate wedged.
         let held = limits.acquire(5).await.expect("slot");
@@ -217,7 +230,11 @@ mod tests {
         waiter.abort();
         let _ = waiter.await;
         drop(held);
-        assert_eq!(limits.available(5), Some(1), "an abandoned waiter consumed the slot");
+        assert_eq!(
+            limits.available(5),
+            Some(1),
+            "an abandoned waiter consumed the slot"
+        );
     }
 
     #[tokio::test]
@@ -225,10 +242,12 @@ mod tests {
         // `0` is what a caller writes to mean "no cap"; taking it literally would hang every request.
         let limits = RequestLimits::new(&caps(&[(11, 0)]));
         assert!(!limits.is_limited(11));
-        assert!(tokio::time::timeout(Duration::from_millis(200), limits.acquire(11))
-            .await
-            .expect("must not block")
-            .is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), limits.acquire(11))
+                .await
+                .expect("must not block")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -255,9 +274,16 @@ mod tests {
 
         drop(held);
         for w in waiters {
-            tokio::time::timeout(Duration::from_secs(1), w).await.expect("drained").unwrap();
+            tokio::time::timeout(Duration::from_secs(1), w)
+                .await
+                .expect("drained")
+                .unwrap();
         }
-        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3, 4], "the gate is not FIFO");
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![0, 1, 2, 3, 4],
+            "the gate is not FIFO"
+        );
     }
 
     #[tokio::test]
@@ -269,7 +295,10 @@ mod tests {
         let l = limits.clone();
         let third = tokio::spawn(async move { l.acquire(11).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!third.is_finished(), "a third caller was admitted to a cap of 2");
+        assert!(
+            !third.is_finished(),
+            "a third caller was admitted to a cap of 2"
+        );
         third.abort();
     }
 }

@@ -100,7 +100,8 @@ impl<T> SlotState<T> {
         if self.next_attempt.is_some_and(|t| now < t) {
             return false;
         }
-        self.updated_at.is_some_and(|t| now.duration_since(t) >= interval)
+        self.updated_at
+            .is_some_and(|t| now.duration_since(t) >= interval)
     }
 }
 
@@ -144,7 +145,9 @@ impl<T> Default for Slot<T> {
 
 impl<T> std::fmt::Debug for Slot<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Slot").field("loaded", &self.value.load().is_some()).finish()
+        f.debug_struct("Slot")
+            .field("loaded", &self.value.load().is_some())
+            .finish()
     }
 }
 
@@ -164,13 +167,19 @@ pub struct SlotHandle<K, T> {
 
 impl<K: Clone, T> Clone for SlotHandle<K, T> {
     fn clone(&self) -> Self {
-        Self { key: self.key.clone(), slot: self.slot.clone() }
+        Self {
+            key: self.key.clone(),
+            slot: self.slot.clone(),
+        }
     }
 }
 
 impl<K: std::fmt::Debug, T> std::fmt::Debug for SlotHandle<K, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SlotHandle").field("key", &self.key).field("slot", &self.slot).finish()
+        f.debug_struct("SlotHandle")
+            .field("key", &self.key)
+            .field("slot", &self.slot)
+            .finish()
     }
 }
 
@@ -486,7 +495,8 @@ impl<K, T> SlotHandle<K, T> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, E>>,
     {
-        self.get_or_fetch_aged(|| async { fetch().await.map(|t| (t, Duration::ZERO)) }).await
+        self.get_or_fetch_aged(|| async { fetch().await.map(|t| (t, Duration::ZERO)) })
+            .await
     }
 
     /// The whole lifecycle for a value with **no push stream**: fetch it when the slot is empty,
@@ -565,8 +575,11 @@ impl<K, T> SlotHandle<K, T> {
                 Ok(arc)
             }
             Err(e) => {
-                self.slot.state.lock().unwrap_or_else(|e| e.into_inner()).next_attempt =
-                    Some(Instant::now() + retry_after);
+                self.slot
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .next_attempt = Some(Instant::now() + retry_after);
                 // Keep serving whatever is there: stale is better than nothing for this value.
                 self.load().ok_or(Some(e))
             }
@@ -587,7 +600,11 @@ impl<K, T> SlotHandle<K, T> {
         if let Some(v) = self.load() {
             return Ok(v); // the caller that held the gate just filled it
         }
-        self.slot.state.lock().unwrap_or_else(|e| e.into_inner()).fetching = true;
+        self.slot
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fetching = true;
 
         let fetched = fetch().await;
 
@@ -621,7 +638,9 @@ pub struct Registry<K, T> {
 
 impl<K, T> Default for Registry<K, T> {
     fn default() -> Self {
-        Self { slots: Mutex::new(HashMap::new()) }
+        Self {
+            slots: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -639,13 +658,21 @@ where
     pub fn handle(&self, key: &K) -> SlotHandle<K, T> {
         let mut slots = self.slots.lock().expect("registry map poisoned");
         let slot = slots.entry(key.clone()).or_default().clone();
-        SlotHandle { key: key.clone(), slot }
+        SlotHandle {
+            key: key.clone(),
+            slot,
+        }
     }
 
     /// The table for `key` if one is loaded. Convenience — prefer [`handle`](Self::handle) on a hot
     /// path, since this takes the map lock.
     pub fn get(&self, key: &K) -> Option<Arc<T>> {
-        let slot = self.slots.lock().expect("registry map poisoned").get(key)?.clone();
+        let slot = self
+            .slots
+            .lock()
+            .expect("registry map poisoned")
+            .get(key)?
+            .clone();
         slot.value.load_full()
     }
 
@@ -664,15 +691,27 @@ where
 
     /// See [`SlotHandle::invalidate`].
     pub fn invalidate(&self, key: &K) {
-        let slot = self.slots.lock().expect("registry map poisoned").get(key).cloned();
+        let slot = self
+            .slots
+            .lock()
+            .expect("registry map poisoned")
+            .get(key)
+            .cloned();
         if let Some(slot) = slot {
-            SlotHandle { key: key.clone(), slot }.invalidate();
+            SlotHandle {
+                key: key.clone(),
+                slot,
+            }
+            .invalidate();
         }
     }
 
     /// Forget `key`. Handles already taken keep working against the detached slot.
     pub fn remove(&self, key: &K) {
-        self.slots.lock().expect("registry map poisoned").remove(key);
+        self.slots
+            .lock()
+            .expect("registry map poisoned")
+            .remove(key);
     }
 
     /// Number of keys with a table loaded — i.e. how many copies of the table are resident.
@@ -702,7 +741,12 @@ where
 
     /// Every key with a slot, loaded or not.
     pub fn all_keys(&self) -> Vec<K> {
-        self.slots.lock().expect("registry map poisoned").keys().cloned().collect()
+        self.slots
+            .lock()
+            .expect("registry map poisoned")
+            .keys()
+            .cloned()
+            .collect()
     }
 }
 
@@ -740,17 +784,29 @@ mod tests {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            reg.handle(&key).merge(1, |_| panic!("simulated parser panic under the lock"));
+            reg.handle(&key)
+                .merge(1, |_| panic!("simulated parser panic under the lock"));
         }))
         .is_err();
         std::panic::set_hook(prev);
-        assert!(unwound, "the closure must actually have panicked under the lock");
+        assert!(
+            unwound,
+            "the closure must actually have panicked under the lock"
+        );
 
         // A sibling connection must still be able to read and write the slot.
         let sibling = reg.handle(&key);
-        assert_eq!(sibling.load().as_deref().copied(), Some(1), "the table still serves");
+        assert_eq!(
+            sibling.load().as_deref().copied(),
+            Some(1),
+            "the table still serves"
+        );
         sibling.insert(Arc::new(2));
-        assert_eq!(sibling.load().as_deref().copied(), Some(2), "and the slot still accepts writes");
+        assert_eq!(
+            sibling.load().as_deref().copied(),
+            Some(2),
+            "and the slot still accepts writes"
+        );
         assert!(sibling.merge(2, |v| *v + 1), "and still merges");
     }
 
@@ -786,7 +842,10 @@ mod tests {
 
         r.remove(&key());
         assert!(r.get(&key()).is_none(), "the registry forgot the key");
-        assert!(h.load().is_some(), "an existing handle keeps working on the detached slot");
+        assert!(
+            h.load().is_some(),
+            "an existing handle keeps working on the detached slot"
+        );
     }
 
     #[test]
@@ -819,7 +878,10 @@ mod tests {
         assert_eq!(merges.load(Ordering::SeqCst), 1, "one frame, one merge");
         assert_eq!(r.get(&key()).unwrap().len(), 1);
 
-        assert!(r.merge(&key(), 0x1234, push("OTHER")), "a different batch is not swallowed");
+        assert!(
+            r.merge(&key(), 0x1234, push("OTHER")),
+            "a different batch is not swallowed"
+        );
         assert_eq!(r.get(&key()).unwrap().len(), 2);
     }
 
@@ -830,7 +892,10 @@ mod tests {
         assert!(r.merge(&key(), 1, push("A")));
         assert!(r.merge(&key(), 2, push("B")));
         assert!(!r.merge(&key(), 1, |_: &Table| panic!("must not re-run")));
-        assert_eq!(*r.get(&key()).unwrap(), vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(
+            *r.get(&key()).unwrap(),
+            vec!["A".to_string(), "B".to_string()]
+        );
     }
 
     #[test]
@@ -848,7 +913,10 @@ mod tests {
         h.insert(live.clone());
 
         let effective = h.seed_aged(Arc::new(vec!["DISK".to_string()]), Duration::from_secs(1));
-        assert!(Arc::ptr_eq(&effective, &live), "the fleet's table is at least as fresh as disk");
+        assert!(
+            Arc::ptr_eq(&effective, &live),
+            "the fleet's table is at least as fresh as disk"
+        );
     }
 
     #[test]
@@ -858,7 +926,10 @@ mod tests {
         let r = reg();
         let h = r.handle(&key());
         h.seed_aged(Arc::new(vec!["OLD".into()]), Duration::from_secs(7200));
-        assert!(h.is_refresh_due(Duration::from_secs(3600)), "an old cache is due immediately");
+        assert!(
+            h.is_refresh_due(Duration::from_secs(3600)),
+            "an old cache is due immediately"
+        );
 
         let fresh = r.handle(&"other".to_string());
         fresh.seed_aged(Arc::new(vec!["NEW".into()]), Duration::ZERO);
@@ -879,7 +950,10 @@ mod tests {
     #[test]
     fn nothing_is_reconciled_before_it_is_loaded() {
         let r = reg();
-        assert!(!r.handle(&key()).is_refresh_due(ZERO), "an empty slot is a fetch, not a refresh");
+        assert!(
+            !r.handle(&key()).is_refresh_due(ZERO),
+            "an empty slot is a fetch, not a refresh"
+        );
     }
 
     #[test]
@@ -895,7 +969,10 @@ mod tests {
 
         // The same digest must be applicable again against a rebuilt table.
         h.insert(Arc::new(vec!["EURUSD".into()]));
-        assert!(h.merge(7, push("X")), "dedup history must not survive a rebuild");
+        assert!(
+            h.merge(7, push("X")),
+            "dedup history must not survive a rebuild"
+        );
     }
 
     #[test]
@@ -928,7 +1005,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(Arc::ptr_eq(&a, &b), "every caller gets the SAME Arc, not a copy");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "every caller gets the SAME Arc, not a copy"
+        );
     }
 
     #[tokio::test]
@@ -953,7 +1033,11 @@ mod tests {
         for t in tasks {
             tables.push(t.await.unwrap());
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "8 racing callers, one fetch");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "8 racing callers, one fetch"
+        );
         assert!(tables.windows(2).all(|w| Arc::ptr_eq(&w[0], &w[1])));
     }
 
@@ -997,11 +1081,17 @@ mod tests {
         };
 
         started.notified().await;
-        assert!(r.merge(&"srv".to_string(), 7, push("NEWSYM")), "buffered, not applied");
+        assert!(
+            r.merge(&"srv".to_string(), 7, push("NEWSYM")),
+            "buffered, not applied"
+        );
         release.notify_one();
 
         let table = fetch.await.unwrap();
-        assert!(table.contains(&"NEWSYM".to_string()), "the buffered push replayed onto the snapshot");
+        assert!(
+            table.contains(&"NEWSYM".to_string()),
+            "the buffered push replayed onto the snapshot"
+        );
         assert!(table.contains(&"EURUSD".to_string()));
     }
 
@@ -1035,7 +1125,8 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
 
         let winner = {
-            let (r, calls, started, release) = (r.clone(), calls.clone(), started.clone(), release.clone());
+            let (r, calls, started, release) =
+                (r.clone(), calls.clone(), started.clone(), release.clone());
             tokio::spawn(async move {
                 r.handle(&"srv".to_string())
                     .refresh_if_due::<_, _, ()>(ZERO, NEVER, || async move {
@@ -1060,7 +1151,11 @@ mod tests {
         }
         release.notify_one();
         assert!(winner.await.unwrap());
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "one re-fetch for the whole fleet");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one re-fetch for the whole fleet"
+        );
         assert_eq!(*r.get(&key()).unwrap(), vec!["NEW".to_string()]);
     }
 
@@ -1078,7 +1173,10 @@ mod tests {
             .expect_err("the fetch failed");
         assert_eq!(err, "boom");
         assert_eq!(*h.load().unwrap(), vec!["OLD".to_string()], "still serving");
-        assert!(!h.is_refresh_due(ZERO), "and not retried on the next heartbeat");
+        assert!(
+            !h.is_refresh_due(ZERO),
+            "and not retried on the next heartbeat"
+        );
     }
 
     #[tokio::test]
@@ -1104,12 +1202,18 @@ mod tests {
         };
         started.notified().await;
         assert!(r.merge(&key(), 7, push("NEWSYM")));
-        assert!(!r.get(&key()).unwrap().contains(&"NEWSYM".to_string()), "buffered, not applied");
+        assert!(
+            !r.get(&key()).unwrap().contains(&"NEWSYM".to_string()),
+            "buffered, not applied"
+        );
 
         release.notify_one();
         assert!(refresh.await.unwrap().is_err());
         let table = r.get(&key()).unwrap();
-        assert!(table.contains(&"NEWSYM".to_string()), "replayed onto the surviving table");
+        assert!(
+            table.contains(&"NEWSYM".to_string()),
+            "replayed onto the surviving table"
+        );
         assert!(table.contains(&"EURUSD".to_string()));
     }
 

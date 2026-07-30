@@ -164,7 +164,12 @@ pub struct EgressMeter {
 impl EgressMeter {
     /// `stall_after` is the no-progress bound; see [`DEFAULT_EGRESS_STALL_MS`].
     pub fn new(stall_after: Duration) -> Self {
-        Self { enqueued: 0, flushed: 0, last_progress: Instant::now(), stall_after }
+        Self {
+            enqueued: 0,
+            flushed: 0,
+            last_progress: Instant::now(),
+            stall_after,
+        }
     }
 
     /// Account for `n` bytes just appended to the buffer. Returns the cumulative offset at which those
@@ -265,15 +270,24 @@ mod tests {
         m.enqueue(1000, Instant::now());
 
         tokio::time::advance(Duration::from_secs(4)).await;
-        assert!(!m.stalled(1000, Instant::now()), "4s of no progress is within the bound");
+        assert!(
+            !m.stalled(1000, Instant::now()),
+            "4s of no progress is within the bound"
+        );
 
         // One byte accepted is progress: the clock restarts.
         m.observe(999, Instant::now());
         tokio::time::advance(Duration::from_secs(4)).await;
-        assert!(!m.stalled(999, Instant::now()), "the bound is per-stall, not per-frame");
+        assert!(
+            !m.stalled(999, Instant::now()),
+            "the bound is per-stall, not per-frame"
+        );
 
         tokio::time::advance(Duration::from_secs(2)).await;
-        assert!(m.stalled(999, Instant::now()), "6s with nothing accepted is a stalled peer");
+        assert!(
+            m.stalled(999, Instant::now()),
+            "6s with nothing accepted is a stalled peer"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -283,12 +297,18 @@ mod tests {
         m.observe(0, Instant::now());
 
         tokio::time::advance(Duration::from_secs(3600)).await;
-        assert!(!m.stalled(0, Instant::now()), "nothing outstanding cannot be stuck");
+        assert!(
+            !m.stalled(0, Instant::now()),
+            "nothing outstanding cannot be stuck"
+        );
 
         // ...and the first frame after a long idle gets a full window, rather than inheriting a
         // deadline that elapsed an hour ago.
         m.enqueue(10, Instant::now());
-        assert!(!m.stalled(10, Instant::now()), "the clock starts when the buffer stops being empty");
+        assert!(
+            !m.stalled(10, Instant::now()),
+            "the clock starts when the buffer stops being empty"
+        );
         assert_eq!(m.deadline(), Instant::now() + Duration::from_secs(5));
     }
 }

@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Fully hermetic: no network, no fixtures, and every deadline is tested against tokio's
+      # virtual clock rather than a real sleep, so these do not flake under a loaded runner.
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Doc tests
+        run: cargo test --doc
+
+      - name: Docs build without warnings
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # This crate is published and depended on by several clients, so a packaging break is a
+      # release-day surprise. Catch it here instead.
+      - name: Package
+        run: cargo publish --dry-run
