@@ -21,6 +21,7 @@
 //! |---|---|---|
 //! | [`egress`] | how much outbound data we accept | a byte watermark, plus a no-progress deadline |
 //! | [`limits`] | how many of one request kind are in flight | a fair semaphore, per request kind |
+//! | [`pacer`] | how many of one request kind per second | a token bucket, per request kind |
 //! | [`registry`] | how often shared state is re-fetched | a refresh clock plus single-flight |
 //!
 //! # What these are not
@@ -39,8 +40,10 @@
 
 pub mod egress;
 pub mod limits;
+pub mod pacer;
 pub mod registry;
 
 pub use egress::EgressMeter;
 pub use limits::RequestLimits;
+pub use pacer::{Pacer, Rate};
 pub use registry::{Registry, SlotHandle};

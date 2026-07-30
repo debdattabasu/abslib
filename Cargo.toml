@@ -1,8 +1,8 @@
 [package]
 name = "abslib"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Reusable async networking primitives for single-task protocol drivers: egress backpressure, per-command concurrency ceilings, and a shared refresh/single-flight registry"
+description = "Reusable async networking primitives for single-task protocol drivers: egress backpressure, per-kind concurrency ceilings and rate pacing, and a shared refresh/single-flight registry"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/debdattabasu/abslib"
 keywords = ["tokio", "backpressure", "networking", "async"]

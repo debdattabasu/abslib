@@ -53,6 +53,7 @@ Hence the rule all three modules apply:
 |---|---|---|
 | [`egress`](src/egress.rs) | how much outbound data we accept | a byte watermark, plus a no-progress deadline |
 | [`limits`](src/limits.rs) | how many of one request kind are in flight | a fair semaphore, per request kind |
+| [`pacer`](src/pacer.rs) | how many of one request kind per second | a token bucket, per request kind |
 | [`registry`](src/registry.rs) | how often shared state is re-fetched | a refresh clock plus single-flight |
 
 ## `egress` — outbound backpressure that isn't a timeout
@@ -121,6 +122,39 @@ honest and safe to retry; a generic error from a refused concurrent request is n
 allowance of 2 may still lose requests intermittently, varying by access pattern and between sessions,
 which is consistent with server-side load rather than any rule a client could schedule around. Depth 1 is
 often the only depth that never fails.
+
+## `pacer` — per-kind rate limiting
+
+The sibling of `limits`, and constantly confused with it. `limits` bounds how many are **in flight**;
+`pacer` bounds how many per **second**. They are not interchangeable: a semaphore cannot enforce a rate,
+because rate ≈ concurrency ÷ latency and latency is not yours to control — a cap of 2 permits 20/s against a
+100 ms server and 200/s against a 10 ms one.
+
+A bucket rather than a minimum interval, for two reasons found by measuring:
+
+- Servers commonly tolerate a **burst** and object only to the sustained rate. Even spacing throws that
+  headroom away — a four-way fan-out pays three artificial delays for something the server takes at once.
+- Even spacing taxes every request when nothing is near the limit: at 45/s that is ~22 ms each, so a burst
+  of ten costs ≥220 ms of pure waiting.
+
+```rust
+use abslib::{Pacer, Rate};
+use std::collections::HashMap;
+# #[tokio::main(flavor = "current_thread")] async fn main() {
+// Kind 11: 10/s sustained, but 4 may go at once from idle.
+let pacer = Pacer::new(&HashMap::from([(11, Rate::new(10.0, 4))]));
+
+pacer.acquire(11).await;   // free — the bucket starts full
+// ...three more are also free, then the rate binds.
+
+// `Rate::spaced(n)` is strict 1/n spacing, for a server that really wants no burst.
+# }
+```
+
+Wait in the **caller's** task, before building the request and inside the caller's own deadline — same
+placement as `limits`, and for the same reason: pacing inside a driver means either sleeping in a `select!`
+handler or parking the command in a queue something else must remember to retry. Where a driver must pace
+its own traffic, gate the loop on `ready_at` instead.
 
 ## `registry` — shared tables, refreshed safely
 
